@@ -45,6 +45,7 @@ pub enum Message {
     LintMods(LintMods),
     SelfUpdate(SelfUpdate),
     FetchSelfUpdateProgress(FetchSelfUpdateProgress),
+    FetchSubscriptions(FetchSubscriptions),
 }
 
 impl Message {
@@ -58,6 +59,7 @@ impl Message {
             Self::LintMods(msg) => msg.receive(app),
             Self::SelfUpdate(msg) => msg.receive(app),
             Self::FetchSelfUpdateProgress(msg) => msg.receive(app),
+            Self::FetchSubscriptions(msg) => msg.receive(app),
         }
     }
 }
@@ -81,8 +83,9 @@ impl ResolveMods {
         let store = app.state.store.clone();
         let ctx = ctx.clone();
         let tx = app.tx.clone();
-        let handle = tokio::spawn(async move {
+        let handle: JoinHandle<()> = tokio::spawn(async move {
             let result = store.resolve_mods(&specs, false).await;
+            // NOTE: send out modio request??
             tx.send(Message::ResolveMods(Self {
                 rid,
                 specs,
@@ -728,4 +731,110 @@ async fn self_update_async(
     info!("update successful");
 
     Ok(original_exe_path)
+}
+
+use modio::Error; // BAD! 
+#[derive(Debug)]
+pub struct FetchSubscriptions {
+    rid: RequestID,
+    result: Result<Vec<String>, Error>,
+}
+
+impl FetchSubscriptions {
+    pub fn send(
+        app: &mut App,
+        ctx: &egui::Context,
+        //oauth_token: &str,
+    ) {
+        // let rid = rc.next();
+        // let ctx = ctx.clone();
+        let mut _oauth_token: Option<String> = None;
+        if let Some(modio_provider_params) = app.state.config.provider_parameters.get("modio")
+        && let Some(oauth_token) = modio_provider_params.get("oauth")
+        {
+            _oauth_token = Some(oauth_token.to_string());
+        } else {
+            error!("ouath token fail");
+            return;
+        }
+
+        let rid = app.request_counter.next();
+        let ctx = ctx.clone();
+        let tx = app.tx.clone();
+        let handle: JoinHandle<()> = tokio::spawn(async move {
+            let result = fetch_modio_subscriptions(_oauth_token.unwrap()).await;
+            
+            tx.send(Message::FetchSubscriptions(Self {
+                rid,
+                result,
+            }))
+            .await
+            .unwrap();
+            ctx.request_repaint();
+        });
+        app.last_action = None;
+        app.fetch_subscriptions_rid = Some(MessageHandle {
+            rid,
+            handle,
+            state: (),
+        });
+    }
+
+    fn receive(self, app: &mut App) {
+        if Some(self.rid) == app.fetch_subscriptions_rid.as_ref().map(|r| r.rid) {
+            match self.result {
+                Ok(mod_list) => {
+                    info!("fetch subscriptions successful");
+
+                    let mut result: String = "".to_string();
+                    for entry in mod_list.iter(){
+                        result += entry;
+                        result += "\n";
+                    }
+
+                    app.resolve_mod = result;
+                    // we need the ctx object to call this, but just shoving it into the textbox should be good enough
+                    //ResolveMods::send(app, ctx, app.parse_mods(), false); 
+                    app.last_action = Some(LastAction::success("subscriptions fetching complete".to_string()));
+                }
+                Err(e) => {
+                    error!("fetch subscriptions failed");
+                    error!("{:#?}", e);
+                    app.last_action = Some(LastAction::failure(e.to_string()));
+                }
+            }
+            app.fetch_subscriptions_rid = None;
+        }
+    }
+}
+
+
+async fn fetch_modio_subscriptions(oauth_token: String) -> Result<Vec<String>, modio::Error> {
+    // NOTE: temp solution because what the hell function do i call to get the modio object normally
+        use crate::providers::modio::{LoggingMiddleware, MODIO_DRG_ID}; 
+        use modio::{filter::prelude::*, Credentials, Modio};
+        use futures::TryStreamExt;
+
+        let credentials = Credentials::with_token("", oauth_token);
+        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+            .with::<LoggingMiddleware>(Default::default())
+            .build();
+        let modio = Modio::new(credentials, client.clone())?;
+    //
+
+    // create the user subscrtions query & begin iterating
+    let subscriptions = modio.user().subscriptions(ModId::desc());
+    let mut st = subscriptions.iter().await?;
+
+    // process each entry into an exportable list of URLs
+    let mut result: Vec<String> = Vec::new();
+    while let Some(mod_) = st.try_next().await? {
+        // exclude subscriptions that aren't for DRG
+        if mod_.game_id == MODIO_DRG_ID{
+            // profile URL is the url to the mod page
+            result.push(mod_.profile_url.as_str().to_string());
+        }
+    }
+
+    Ok(result)
 }
